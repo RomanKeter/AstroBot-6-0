@@ -19,7 +19,8 @@ jobs:
 
       - name: Check syntax
         run: |
-          python -m py_compile src/bot.py
-          python -m py_compile src/astro_engine.py
-          python -m py_compile src/database.py
+          python -m py_compile bot.py
+          python -m py_compile astro_engine.py
+          python -m py_compile database.py
+          python -m py_compile keyboards.py
           echo "All files OK"
