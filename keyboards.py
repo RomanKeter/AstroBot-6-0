@@ -9,7 +9,8 @@ def main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔮 Моя карта"), KeyboardButton(text="📅 Прогноз")],
-            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")]
+            [KeyboardButton(text="💑 Совместимость"), KeyboardButton(text="📍 Мой регион")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True
     )
@@ -19,7 +20,7 @@ def settings_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✏️ Изменить данные")],
-            [KeyboardButton(text="📜 История"), KeyboardButton(text="🔙 Назад")]
+            [KeyboardButton(text="📜 История"), KeyboardButton(text="🔙 Назад")],
         ],
         resize_keyboard=True
     )
