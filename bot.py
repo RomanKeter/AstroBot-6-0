@@ -1,13 +1,13 @@
 """
 Telegram бот астролог.
 
-Исправления в этой версии:
-  1. Зависание геокодинга: TimezoneFinder инициализируется один раз при старте,
-     а не при каждом запросе (было: ~3 сек загрузка файла при каждом запросе).
-  2. Прогноз: выбор периода через инлайн-кнопки (сегодня/завтра/неделя/месяц/своя дата).
-  3. Натальная карта: полная западная карта с 12 домами + AI-интерпретация каждого дома.
-  4. Партнёры: раздел «👥 Партнёры» с выбором из базы, у каждого партнёра своё меню
-     (совместимость / натальная карта / прогноз / удалить).
+Возможности:
+  1. Натальная карта через kerykeion (Swiss Ephemeris) — точный расчёт.
+  2. Прогнозы на день/неделю/месяц с учётом транзитов.
+  3. Партнёры: совместимость, карты, прогнозы.
+  4. Свободный AI-диалог: персонализированный астрологический ассистент,
+     который знает натальную карту пользователя, текущие транзиты,
+     и даёт индивидуальные советы.
 """
 
 import os
@@ -16,6 +16,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import httpx
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ from astro_engine import (
     calculate_natal_chart, format_chart_text, format_full_chart_text,
     build_houses_prompt, build_partner_prompt,
     build_compatibility_prompt, get_transits, calculate_compatibility,
+    build_natal_summary, get_current_transits, format_transits_text,
 )
 from database import AstroDatabase
 from keyboards import (
@@ -64,10 +66,11 @@ http_client = httpx.AsyncClient(timeout=15.0)
 groq_client = AsyncGroq(api_key=GROQ_KEY, http_client=http_client) if GROQ_KEY else None
 db          = AstroDatabase()
 
-# ── TimezoneFinder: инициализируется ОДИН РАЗ при старте ─────────────────────
-# Решение зависания: при первом вызове tf = TimezoneFinder() идёт загрузка
-# ~100 МБ файла эфемерид — это занимает 2–4 секунды. Если создавать объект
-# при каждом запросе города, бот «зависает» в момент геокодинга.
+# ── История диалогов (in-memory, последние N сообщений на пользователя) ──────
+MAX_HISTORY = 20  # Максимум сообщений в истории диалога
+chat_histories: dict[int, list[dict]] = defaultdict(list)
+
+# ── TimezoneFinder ────────────────────────────────────────────────────────────
 _tf = None
 
 def get_tf():
@@ -109,10 +112,6 @@ class ForecastCustom(StatesGroup):
 # ── Геокодинг ─────────────────────────────────────────────────────────────────
 
 async def geocode_city(city_name: str) -> dict | None:
-    """
-    Координаты + timezone через Nominatim (бесплатно, без ключа).
-    TimezoneFinder используется из уже загруженного singleton — без зависания.
-    """
     try:
         resp = await http_client.get(
             "https://nominatim.openstreetmap.org/search",
@@ -128,13 +127,11 @@ async def geocode_city(city_name: str) -> dict | None:
         lon          = float(results[0]["lon"])
         display_name = results[0].get("display_name", city_name).split(",")[0].strip()
 
-        # Timezone — используем уже инициализированный объект (без зависания)
         tz = "UTC"
         tf = get_tf()
         if tf:
             tz = tf.timezone_at(lat=lat, lng=lon) or "UTC"
         else:
-            # Запасной вариант если timezonefinder не установлен
             try:
                 r2 = await http_client.get(
                     "https://timeapi.io/api/TimeZone/coordinate",
@@ -198,10 +195,89 @@ async def ask_groq(prompt: str, max_tokens: int = 1200) -> str | None:
         return None
 
 
+async def ask_groq_chat(messages: list[dict], max_tokens: int = 1500) -> str | None:
+    """Вызов Groq с полной историей сообщений (system + user/assistant)."""
+    if not groq_client:
+        return None
+    try:
+        resp = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Groq chat error: {e}")
+        return None
+
+
 async def send_long(message: types.Message, text: str, **kwargs):
     """Отправить длинный текст, разбив на части по 4000 символов."""
     for i in range(0, len(text), 4000):
         await message.answer(text[i:i + 4000], **kwargs)
+
+
+def _build_system_prompt(user: dict) -> str:
+    """
+    Строит системный промпт для персонализированного AI-ассистента.
+    Включает:
+    - натальную карту пользователя
+    - текущие транзиты
+    - текущее местоположение
+    - дату и время
+    """
+    chart = user.get('chart', {})
+    natal_summary = build_natal_summary(chart)
+
+    current_city = user.get('current_city') or user.get('city', 'не указан')
+    current_tz = user.get('current_timezone') or user.get('timezone', 'UTC')
+
+    # Текущие транзиты
+    try:
+        transits = get_current_transits()
+        transits_text = format_transits_text(transits)
+    except Exception:
+        transits_text = "(транзиты недоступны)"
+
+    now = datetime.now()
+
+    system_prompt = f"""Ты — профессиональный астролог-консультант с глубокими знаниями западной астрологии.
+Ты ведёшь персональный диалог с человеком, чью натальную карту ты знаешь.
+
+═══ НАТАЛЬНАЯ КАРТА КЛИЕНТА ═══
+{natal_summary}
+
+Солнечный знак: {chart.get('sun_sign', '?')}
+Лунный знак: {chart.get('moon_sign', '?')}
+Асцендент: {chart.get('ascendant', '?')}
+
+═══ ТЕКУЩАЯ АСТРОЛОГИЧЕСКАЯ ОБСТАНОВКА ═══
+Дата: {now.strftime('%d.%m.%Y')}, время: {now.strftime('%H:%M')} UTC
+Текущие транзиты планет:
+{transits_text}
+
+═══ МЕСТОПОЛОЖЕНИЕ КЛИЕНТА ═══
+Регион: {current_city} (часовой пояс: {current_tz})
+
+═══ ПРАВИЛА ПОВЕДЕНИЯ ═══
+1. Ты ВСЕГДА опираешься на натальную карту клиента при ответах.
+2. Ты учитываешь текущие транзиты и их аспекты к натальным планетам.
+3. Ты даёшь строго ИНДИВИДУАЛЬНЫЕ советы — не общие гороскопы.
+4. Если клиент спрашивает о конкретной ситуации (бизнес, отношения, здоровье),
+   ты анализируешь, какие дома и планеты задействованы, и даёшь конкретный совет.
+5. Если клиент хочет выбрать оптимальное время для дела (свидание, переговоры,
+   подписание контракта и т.д.), ты подбираешь благоприятный период на основе
+   транзитов и натальной карты. Если нужно — уточни, на какой примерно период
+   (ближайшая неделя, месяц и т.д.).
+6. Тон: тёплый, но профессиональный. Конкретные рекомендации, а не размытые фразы.
+7. Отвечай на русском языке.
+8. Не используй HTML-разметку в ответах, пиши обычным текстом с эмодзи.
+9. Если клиент задаёт вопрос не по астрологии — мягко направь разговор к астрологии,
+   но не отказывайся помогать.
+10. Длина ответа: 150–400 слов, кратко и по делу."""
+
+    return system_prompt
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -214,7 +290,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         chart = user.get('chart', {})
         await message.answer(
             f"✨ С возвращением, {user.get('first_name') or 'друг'}!\n"
-            f"Твой знак: {chart.get('sun_sign', '?')}",
+            f"Твой знак: {chart.get('sun_sign', '?')}\n\n"
+            f"Можешь использовать кнопки меню или просто написать мне свой вопрос — "
+            f"я отвечу с учётом твоей натальной карты! 🔮",
             reply_markup=main_menu()
         )
     else:
@@ -302,10 +380,15 @@ async def reg_city(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+    # Очистить историю чата — данные обновились
+    chat_histories.pop(message.from_user.id, None)
+
     chart_text = format_chart_text(chart, {'city': geo["display_name"]})
     await msg.edit_text(
         f"✨ <b>Данные сохранены!</b>\n\n<pre>{chart_text}</pre>\n\n"
-        f"🕐 Часовой пояс: {geo['timezone']}",
+        f"🕐 Часовой пояс: {geo['timezone']}\n\n"
+        f"Теперь ты можешь задавать мне любые вопросы по астрологии — "
+        f"я буду отвечать с учётом твоей карты! 🔮",
         parse_mode=ParseMode.HTML, reply_markup=main_menu()
     )
 
@@ -323,14 +406,12 @@ async def show_natal(message: types.Message):
     chart = user.get('chart', {})
     msg   = await message.answer("🔮 Строю натальную карту...")
 
-    # Шаг 1: технические данные карты
     full_text = format_full_chart_text(chart)
     await msg.edit_text(
         f"<b>🔮 Натальная карта</b>\n\n{full_text}",
         parse_mode=ParseMode.HTML
     )
 
-    # Шаг 2: AI-интерпретация 12 домов
     msg2 = await message.answer("✨ Генерирую интерпретацию 12 домов...")
     interpretation = await ask_groq(build_houses_prompt(chart), max_tokens=2000)
     if interpretation:
@@ -379,7 +460,6 @@ async def forecast_custom_date(message: types.Message, state: FSMContext):
 async def _do_forecast(message: types.Message, user_id: int,
                         period: str, custom_date: str = None,
                         chart_override: dict = None, location_override: str = None):
-    """Общая функция генерации прогноза (для себя и для партнёра)."""
     user  = db.get_user(user_id)
     if not user:
         return
@@ -409,14 +489,20 @@ async def _do_forecast(message: types.Message, user_id: int,
 
     msg = await message.answer(f"🔮 Составляю прогноз на {date_label}...")
 
+    # Получаем транзиты для прогноза
+    try:
+        transits = get_current_transits()
+        transits_text = format_transits_text(transits)
+    except Exception:
+        transits_text = ""
+
     prompt = (
         f"Ты астролог. Составь прогноз на {date_label}.\n\n"
-        f"Натальная карта:\n"
-        f"Солнце: {chart.get('sun_sign', '?')}\n"
-        f"Луна: {chart.get('moon_sign', '?')}\n"
-        f"Асцендент: {chart.get('ascendant', '?')}\n\n"
+        f"Натальная карта:\n{build_natal_summary(chart)}\n\n"
+        f"Текущие транзиты:\n{transits_text}\n\n"
         f"Текущее местоположение: {current_city} (часовой пояс: {current_tz})\n\n"
         f"Структура прогноза:\n{structure}\n\n"
+        f"ВАЖНО: Учитывай взаимодействие транзитных планет с натальными. "
         f"Тон: конкретный, практичный. Учитывай местоположение."
     )
 
@@ -450,8 +536,6 @@ async def partners_menu(message: types.Message):
         )
 
 
-# Просмотр конкретного партнёра
-
 @dp.callback_query(F.data.startswith("partner:view:"))
 async def partner_view(callback: types.CallbackQuery):
     pid      = int(callback.data.split(":")[2])
@@ -475,8 +559,6 @@ async def partner_view(callback: types.CallbackQuery):
                                       reply_markup=partner_actions_kb(pid))
 
 
-# Вернуться к списку
-
 @dp.callback_query(F.data == "partner:list")
 async def partner_back_list(callback: types.CallbackQuery):
     await callback.answer()
@@ -493,8 +575,6 @@ async def partner_back_list(callback: types.CallbackQuery):
             reply_markup=no_partners_kb()
         )
 
-
-# Добавить нового партнёра
 
 @dp.callback_query(F.data == "partner:add")
 async def partner_add_start(callback: types.CallbackQuery, state: FSMContext):
@@ -538,15 +618,14 @@ async def partner_add_time(message: types.Message, state: FSMContext):
         return
     await state.update_data(partner_time=norm)
     await state.set_state(PartnerAdd.city)
-    await message.answer("Город рождения партнёра:", reply_markup=cancel_menu())
+    await message.answer("Город рождения партнёра?")
 
 
 @dp.message(PartnerAdd.city)
 async def partner_add_city(message: types.Message, state: FSMContext):
     city = message.text.strip()
     msg  = await message.answer("🔍 Ищу город...")
-
-    geo = await geocode_city(city)
+    geo  = await geocode_city(city)
     if not geo:
         await msg.edit_text(f"❌ Город «{city}» не найден. Попробуй снова:")
         return
@@ -554,29 +633,28 @@ async def partner_add_city(message: types.Message, state: FSMContext):
     data = await state.get_data()
     day, month, year = map(int, data['partner_date'].split('.'))
     hour, minute     = map(int, data['partner_time'].split(':'))
-    name             = data['partner_name']
 
-    p_chart = calculate_natal_chart(year, month, day, hour, minute,
-                                    geo["lat"], geo["lon"], city, geo["timezone"])
+    chart = calculate_natal_chart(year, month, day, hour, minute,
+                                  geo["lat"], geo["lon"], city, geo["timezone"])
 
     pid = db.save_partner(
-        user_id=message.from_user.id, name=name,
+        user_id=message.from_user.id,
+        name=data['partner_name'],
         birth_date=f"{year}-{month:02d}-{day:02d}",
-        birth_time=data['partner_time'] if data['partner_time'] != '12:00' else None,
-        city=geo["display_name"], lat=geo["lat"], lon=geo["lon"],
-        chart=p_chart, timezone=geo["timezone"]
+        birth_time=data['partner_time'],
+        city=geo["display_name"],
+        lat=geo["lat"], lon=geo["lon"],
+        chart=chart, timezone=geo["timezone"]
     )
     await state.clear()
 
+    chart_text = format_chart_text(chart, {'city': geo["display_name"]})
     await msg.edit_text(
-        f"✅ <b>{name}</b> сохранён!\n\n"
-        f"☉ {p_chart.get('sun_sign', '?')} · ☽ {p_chart.get('moon_sign', '?')} · ↑ {p_chart.get('ascendant', '?')}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=partner_actions_kb(pid)
+        f"✅ Партнёр <b>{data['partner_name']}</b> сохранён!\n\n"
+        f"<pre>{chart_text}</pre>",
+        parse_mode=ParseMode.HTML, reply_markup=partner_actions_kb(pid)
     )
 
-
-# Совместимость с партнёром
 
 @dp.callback_query(F.data.startswith("partner:compat:"))
 async def partner_compat(callback: types.CallbackQuery):
@@ -603,15 +681,13 @@ async def partner_compat(callback: types.CallbackQuery):
         f"<b>Аспекты:</b>\n{aspects_text}\n\n"
         f"<i>Их карта: ☉ {p_chart.get('sun_sign','?')} · ☽ {p_chart.get('moon_sign','?')}</i>"
     )
-    msg = await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
     prompt = build_compatibility_prompt(my_chart, p_chart, "Я", name, compat)
     interp = await ask_groq(prompt, max_tokens=1000)
     if interp:
         await send_long(callback.message, interp, parse_mode=ParseMode.HTML)
 
-
-# Натальная карта партнёра
 
 @dp.callback_query(F.data.startswith("partner:natal:"))
 async def partner_natal(callback: types.CallbackQuery):
@@ -643,8 +719,6 @@ async def partner_natal(callback: types.CallbackQuery):
         await msg2.edit_text("⚠️ Не удалось получить интерпретацию.")
 
 
-# Прогноз для партнёра
-
 @dp.callback_query(F.data.startswith("partner:forecast:"))
 async def partner_forecast(callback: types.CallbackQuery):
     pid = int(callback.data.split(":")[2])
@@ -657,20 +731,12 @@ async def partner_forecast(callback: types.CallbackQuery):
         return
 
     chart = p.get('chart', {})
-    name  = p.get('name', '?')
     city  = p.get('city', '?')
-
-    # Прогноз сразу на сегодня
     await _do_forecast(
-        callback.message,
-        callback.from_user.id,
-        "today",
-        chart_override=chart,
-        location_override=city
+        callback.message, callback.from_user.id, "today",
+        chart_override=chart, location_override=city
     )
 
-
-# Удалить партнёра
 
 @dp.callback_query(F.data.startswith("partner:delete:"))
 async def partner_delete_confirm(callback: types.CallbackQuery):
@@ -790,16 +856,85 @@ async def show_help(message: types.Message):
         "<b>👥 Партнёры</b> — список партнёров: совместимость, карта, прогноз\n"
         "<b>📍 Мой регион</b> — текущее местоположение для прогнозов\n"
         "<b>⚙️ Настройки</b> — изменить данные рождения\n"
-        "<b>📜 История</b> — последние прогнозы",
+        "<b>📜 История</b> — последние прогнозы\n\n"
+        "💬 <b>Свободный диалог</b> — просто напиши мне вопрос!\n"
+        "Я отвечу с учётом твоей натальной карты, текущих транзитов "
+        "и астрологической обстановки в твоём регионе.",
         parse_mode=ParseMode.HTML, reply_markup=main_menu()
     )
+
+
+# ── Свободный AI-диалог ──────────────────────────────────────────────────────
+
+@dp.message()
+async def free_chat(message: types.Message, state: FSMContext):
+    """
+    Обработчик свободных текстовых сообщений.
+    Если пользователь зарегистрирован — отвечаем как персональный астролог
+    с учётом натальной карты, транзитов и региона.
+    """
+    # Проверяем, что нет активного FSM-состояния
+    current_state = await state.get_state()
+    if current_state is not None:
+        return  # FSM-хэндлеры выше обработают
+
+    user = db.get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "🔮 Чтобы я мог дать тебе персональный совет, "
+            "мне нужны твои данные рождения.\n\n"
+            "Нажми '✏️ Изменить данные' чтобы начать!",
+            reply_markup=settings_menu()
+        )
+        return
+
+    if not groq_client:
+        await message.answer("⚠️ AI-функции временно недоступны.")
+        return
+
+    user_text = message.text.strip()
+    if not user_text:
+        return
+
+    # Показываем «печатает...»
+    msg = await message.answer("🔮 Думаю...")
+
+    # Строим системный промпт с натальными данными
+    system_prompt = _build_system_prompt(user)
+
+    # Добавляем сообщение пользователя в историю
+    uid = message.from_user.id
+    chat_histories[uid].append({"role": "user", "content": user_text})
+
+    # Обрезаем историю до MAX_HISTORY
+    if len(chat_histories[uid]) > MAX_HISTORY:
+        chat_histories[uid] = chat_histories[uid][-MAX_HISTORY:]
+
+    # Формируем messages для Groq
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(chat_histories[uid])
+
+    # Вызов AI
+    response = await ask_groq_chat(messages, max_tokens=1500)
+
+    if response:
+        # Сохраняем ответ ассистента в историю
+        chat_histories[uid].append({"role": "assistant", "content": response})
+        # Обрезаем после добавления
+        if len(chat_histories[uid]) > MAX_HISTORY:
+            chat_histories[uid] = chat_histories[uid][-MAX_HISTORY:]
+
+        await msg.delete()
+        await send_long(message, response)
+    else:
+        await msg.edit_text(
+            "⚠️ Не удалось получить ответ. Попробуй ещё раз через минуту."
+        )
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 async def main():
-    # Прогрев TimezoneFinder ДО начала обработки запросов.
-    # Это гарантирует, что первый запрос города не будет зависать.
     logger.info("Прогрев TimezoneFinder...")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_tf)
