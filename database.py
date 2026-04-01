@@ -1,13 +1,57 @@
 """
 База данных с поддержкой координат, timezone и партнёров.
+Добавлен нечёткий поиск партнёров по имени (склонения русских имён).
 """
 
 import sqlite3
 import json
 import logging
+import re
 from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_name(name: str) -> str:
+    """
+    Нормализация русского имени: убираем типичные окончания склонений.
+    Лена/Лены/Лене/Лену/Леной/Лен → Лен
+    Саша/Саши/Саше/Сашу/Сашей/Саш → Саш
+    """
+    name = name.strip().lower()
+    # Убираем типичные русские окончания (от длинных к коротким)
+    suffixes = ['ой', 'ей', 'ою', 'ею', 'ам', 'ям', 'ами', 'ями', 'ах', 'ях',
+                'ом', 'ем', 'ём', 'ов', 'ев', 'ёв',
+                'ы', 'и', 'у', 'ю', 'е', 'ё', 'а', 'я', 'о']
+    # Минимальная длина основы — 3 буквы
+    for suf in sorted(suffixes, key=len, reverse=True):
+        if name.endswith(suf) and len(name) - len(suf) >= 3:
+            return name[:-len(suf)]
+    return name
+
+
+def fuzzy_match_name(query: str, stored_name: str) -> bool:
+    """
+    Нечёткое сравнение имён с учётом русских склонений.
+    Проверяет совпадение основ (стемов).
+    """
+    q_norm = _normalize_name(query)
+    s_norm = _normalize_name(stored_name)
+
+    # Точное совпадение нормализованных форм
+    if q_norm == s_norm:
+        return True
+
+    # Одна основа начинается с другой (для коротких имён)
+    if len(q_norm) >= 3 and len(s_norm) >= 3:
+        if q_norm.startswith(s_norm) or s_norm.startswith(q_norm):
+            return True
+
+    # Точное совпадение оригиналов (case-insensitive)
+    if query.strip().lower() == stored_name.strip().lower():
+        return True
+
+    return False
 
 
 class AstroDatabase:
@@ -37,17 +81,16 @@ class AstroDatabase:
                         chart_json  TEXT
                     )
                 """)
-                # Добавить колонки если база уже существует (миграция)
                 for col, definition in [
-                    ("current_city",     "TEXT"),
-                    ("current_lat",      "REAL"),
-                    ("current_lon",      "REAL"),
+                    ("current_city", "TEXT"),
+                    ("current_lat", "REAL"),
+                    ("current_lon", "REAL"),
                     ("current_timezone", "TEXT"),
                 ]:
                     try:
                         conn.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
                     except sqlite3.OperationalError:
-                        pass  # Колонка уже существует
+                        pass
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS readings (
@@ -59,7 +102,6 @@ class AstroDatabase:
                     )
                 """)
 
-                # Таблица партнёров для расчёта совместимости
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS partners (
                         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,19 +123,8 @@ class AstroDatabase:
 
     # ─── Пользователи ─────────────────────────────────────────────────────────
 
-    def save_user(
-        self,
-        user_id: int,
-        username: Optional[str],
-        first_name: Optional[str],
-        birth_date: str,
-        birth_time: Optional[str],
-        city: str,
-        lat: float,
-        lon: float,
-        chart: Dict,
-        timezone: str = 'UTC'
-    ) -> bool:
+    def save_user(self, user_id, username, first_name, birth_date, birth_time,
+                  city, lat, lon, chart, timezone='UTC'):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -111,15 +142,8 @@ class AstroDatabase:
             logger.error(f"Save user error: {e}")
             return False
 
-    def update_current_location(
-        self,
-        user_id: int,
-        current_city: str,
-        current_lat: float,
-        current_lon: float,
-        current_timezone: str
-    ) -> bool:
-        """Обновить текущее местоположение пользователя (отличается от города рождения)."""
+    def update_current_location(self, user_id, current_city, current_lat,
+                                current_lon, current_timezone):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -132,7 +156,7 @@ class AstroDatabase:
             logger.error(f"Update location error: {e}")
             return False
 
-    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+    def get_user(self, user_id):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -153,19 +177,8 @@ class AstroDatabase:
 
     # ─── Партнёры ──────────────────────────────────────────────────────────────
 
-    def save_partner(
-        self,
-        user_id: int,
-        name: str,
-        birth_date: str,
-        birth_time: Optional[str],
-        city: str,
-        lat: float,
-        lon: float,
-        chart: Dict,
-        timezone: str = 'UTC'
-    ) -> int:
-        """Сохранить данные партнёра. Возвращает id записи."""
+    def save_partner(self, user_id, name, birth_date, birth_time,
+                     city, lat, lon, chart, timezone='UTC'):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute("""
@@ -182,8 +195,7 @@ class AstroDatabase:
             logger.error(f"Save partner error: {e}")
             return -1
 
-    def get_partners(self, user_id: int) -> List[Dict]:
-        """Получить всех партнёров пользователя."""
+    def get_partners(self, user_id):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -202,8 +214,46 @@ class AstroDatabase:
             logger.error(f"Get partners error: {e}")
             return []
 
-    def delete_partner(self, partner_id: int, user_id: int) -> bool:
-        """Удалить партнёра (проверяем принадлежность user_id)."""
+    def find_partner_by_name(self, user_id: int, name_query: str) -> Optional[Dict]:
+        """
+        Найти партнёра по имени с учётом склонений русского языка.
+        Возвращает первого подходящего партнёра или None.
+        """
+        partners = self.get_partners(user_id)
+
+        # Сначала пробуем точное совпадение (case-insensitive)
+        for p in partners:
+            if p.get('name', '').strip().lower() == name_query.strip().lower():
+                return p
+
+        # Затем нечёткий поиск
+        for p in partners:
+            if fuzzy_match_name(name_query, p.get('name', '')):
+                return p
+
+        return None
+
+    def find_partners_in_text(self, user_id: int, text: str) -> List[Dict]:
+        """
+        Найти всех упомянутых партнёров в тексте.
+        Возвращает список найденных партнёров.
+        """
+        partners = self.get_partners(user_id)
+        found = []
+        words = re.findall(r'[а-яА-ЯёЁa-zA-Z]+', text)
+
+        for word in words:
+            if len(word) < 3:
+                continue
+            for p in partners:
+                if p in found:
+                    continue
+                if fuzzy_match_name(word, p.get('name', '')):
+                    found.append(p)
+
+        return found
+
+    def delete_partner(self, partner_id, user_id):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -217,7 +267,7 @@ class AstroDatabase:
 
     # ─── История ───────────────────────────────────────────────────────────────
 
-    def save_reading(self, user_id: int, reading_type: str, content: str) -> bool:
+    def save_reading(self, user_id, reading_type, content):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
@@ -229,7 +279,7 @@ class AstroDatabase:
             logger.error(f"Save reading error: {e}")
             return False
 
-    def get_readings(self, user_id: int, limit: int = 5) -> List[Dict]:
+    def get_readings(self, user_id, limit=5):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row

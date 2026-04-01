@@ -14,7 +14,7 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔮 Моя карта"),     KeyboardButton(text="📅 Прогноз")],
-            [KeyboardButton(text="👥 Партнёры"),       KeyboardButton(text="📍 Мой регион")],
+            [KeyboardButton(text="👥 Люди"),           KeyboardButton(text="📍 Мой регион")],
             [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True
@@ -60,10 +60,10 @@ def forecast_period_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# ── Инлайн: список партнёров ──────────────────────────────────────────────────
+# ── Инлайн: список людей ──────────────────────────────────────────────────
 
 def partners_list_kb(partners: list) -> InlineKeyboardMarkup:
-    """Кнопка на каждого партнёра + добавить нового."""
+    """Кнопка на каждого человека + добавить нового."""
     rows = []
     for p in partners:
         rows.append([InlineKeyboardButton(
@@ -71,7 +71,7 @@ def partners_list_kb(partners: list) -> InlineKeyboardMarkup:
             callback_data=f"partner:view:{p['id']}"
         )])
     rows.append([InlineKeyboardButton(
-        text="➕ Добавить партнёра",
+        text="➕ Добавить человека",
         callback_data="partner:add"
     )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -79,20 +79,20 @@ def partners_list_kb(partners: list) -> InlineKeyboardMarkup:
 
 def no_partners_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="➕ Добавить партнёра", callback_data="partner:add")
+        InlineKeyboardButton(text="➕ Добавить человека", callback_data="partner:add")
     ]])
 
 
-# ── Инлайн: меню конкретного партнёра ────────────────────────────────────────
+# ── Инлайн: меню конкретного человека ────────────────────────────────────────
 
 def partner_actions_kb(partner_id: int) -> InlineKeyboardMarkup:
-    """Что можно сделать с выбранным партнёром."""
+    """Что можно сделать с выбранным человеком."""
     pid = str(partner_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💑 Совместимость",      callback_data=f"partner:compat:{pid}")],
         [InlineKeyboardButton(text="🔮 Натальная карта",    callback_data=f"partner:natal:{pid}")],
         [InlineKeyboardButton(text="📅 Прогноз для него",   callback_data=f"partner:forecast:{pid}")],
-        [InlineKeyboardButton(text="🗑 Удалить партнёра",   callback_data=f"partner:delete:{pid}")],
+        [InlineKeyboardButton(text="🗑 Удалить профиль",   callback_data=f"partner:delete:{pid}")],
         [InlineKeyboardButton(text="◀️ Назад к списку",     callback_data="partner:list")],
     ])
 

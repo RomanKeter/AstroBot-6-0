@@ -2,6 +2,8 @@
 Астрологический движок — западная астрология.
 Использует библиотеку kerykeion (Swiss Ephemeris) для точных расчётов.
 Fallback: формулы Мееуса (если kerykeion/swisseph недоступны).
+
+Расширено: аспекты между планетами, стихии, кресты, расширенная сводка.
 """
 
 import logging
@@ -54,6 +56,43 @@ SIGN_RULERS = {
     'Козерог': 'Сатурн', 'Водолей': 'Уран', 'Рыбы': 'Нептун',
 }
 
+# ── Стихии и кресты ──────────────────────────────────────────────────────────
+
+ELEMENTS = {
+    'Овен': 'Огонь', 'Лев': 'Огонь', 'Стрелец': 'Огонь',
+    'Телец': 'Земля', 'Дева': 'Земля', 'Козерог': 'Земля',
+    'Близнецы': 'Воздух', 'Весы': 'Воздух', 'Водолей': 'Воздух',
+    'Рак': 'Вода', 'Скорпион': 'Вода', 'Рыбы': 'Вода',
+}
+
+QUALITIES = {
+    'Овен': 'Кардинальный', 'Рак': 'Кардинальный', 'Весы': 'Кардинальный', 'Козерог': 'Кардинальный',
+    'Телец': 'Фиксированный', 'Лев': 'Фиксированный', 'Скорпион': 'Фиксированный', 'Водолей': 'Фиксированный',
+    'Близнецы': 'Мутабельный', 'Дева': 'Мутабельный', 'Стрелец': 'Мутабельный', 'Рыбы': 'Мутабельный',
+}
+
+# ── Аспекты ──────────────────────────────────────────────────────────────────
+
+ASPECTS = {
+    'Соединение':    (0,   8),
+    'Секстиль':      (60,  6),
+    'Квадратура':     (90,  7),
+    'Тригон':         (120, 8),
+    'Оппозиция':      (180, 8),
+    'Квинконс':       (150, 3),
+    'Полусекстиль':   (30,  2),
+}
+
+ASPECT_NATURE = {
+    'Соединение':  'нейтральный (зависит от планет)',
+    'Секстиль':    'гармоничный',
+    'Квадратура':   'напряжённый',
+    'Тригон':       'гармоничный',
+    'Оппозиция':    'напряжённый',
+    'Квинконс':     'напряжённый (скрытый)',
+    'Полусекстиль': 'слабо гармоничный',
+}
+
 
 def translate_sign(sign: str) -> str:
     return ZODIAC_SIGNS_RU.get(sign, sign)
@@ -61,6 +100,111 @@ def translate_sign(sign: str) -> str:
 
 def translate_planet(planet: str) -> str:
     return PLANETS_RU.get(planet, planet)
+
+
+# ── Расчёт аспектов ──────────────────────────────────────────────────────────
+
+def calculate_aspects(planets: Dict) -> List[Dict]:
+    """Рассчитать аспекты между всеми парами натальных планет."""
+    aspect_list = []
+    planet_keys = list(planets.keys())
+
+    for i in range(len(planet_keys)):
+        for j in range(i + 1, len(planet_keys)):
+            p1_key = planet_keys[i]
+            p2_key = planet_keys[j]
+            p1 = planets[p1_key]
+            p2 = planets[p2_key]
+
+            deg1 = p1.get('degree', 0)
+            deg2 = p2.get('degree', 0)
+
+            diff = abs(deg1 - deg2)
+            if diff > 180:
+                diff = 360 - diff
+
+            for aspect_name, (exact_angle, orb) in ASPECTS.items():
+                if abs(diff - exact_angle) <= orb:
+                    aspect_list.append({
+                        'planet1': p1.get('name', p1_key),
+                        'planet2': p2.get('name', p2_key),
+                        'aspect': aspect_name,
+                        'nature': ASPECT_NATURE[aspect_name],
+                        'orb': round(abs(diff - exact_angle), 1),
+                        'exact_angle': exact_angle,
+                    })
+                    break  # одна пара — один аспект (самый точный)
+
+    return aspect_list
+
+
+def calculate_transit_aspects(natal_planets: Dict, transit_planets: Dict) -> List[Dict]:
+    """Рассчитать аспекты транзитных планет к натальным."""
+    aspect_list = []
+
+    for t_key, t_planet in transit_planets.items():
+        for n_key, n_planet in natal_planets.items():
+            t_deg = t_planet.get('degree', 0)
+            n_deg = n_planet.get('degree', 0)
+
+            diff = abs(t_deg - n_deg)
+            if diff > 180:
+                diff = 360 - diff
+
+            for aspect_name, (exact_angle, orb) in ASPECTS.items():
+                # Для транзитов используем более узкие орбисы
+                transit_orb = orb * 0.7
+                if abs(diff - exact_angle) <= transit_orb:
+                    aspect_list.append({
+                        'transit_planet': t_planet.get('name', t_key),
+                        'natal_planet': n_planet.get('name', n_key),
+                        'aspect': aspect_name,
+                        'nature': ASPECT_NATURE[aspect_name],
+                        'orb': round(abs(diff - exact_angle), 1),
+                    })
+                    break
+
+    return aspect_list
+
+
+def analyze_element_balance(chart: Dict) -> Dict:
+    """Анализ баланса стихий и крестов в натальной карте."""
+    elements = {'Огонь': 0, 'Земля': 0, 'Воздух': 0, 'Вода': 0}
+    qualities = {'Кардинальный': 0, 'Фиксированный': 0, 'Мутабельный': 0}
+
+    # Веса планет (личные планеты весят больше)
+    weights = {
+        'Sun': 3, 'Moon': 3, 'Mercury': 2, 'Venus': 2, 'Mars': 2,
+        'Jupiter': 1, 'Saturn': 1, 'Uranus': 1, 'Neptune': 1, 'Pluto': 1,
+    }
+
+    planets = chart.get('planets', {})
+    for key, p in planets.items():
+        sign = p.get('sign', '')
+        w = weights.get(key, 1)
+        if sign in ELEMENTS:
+            elements[ELEMENTS[sign]] += w
+        if sign in QUALITIES:
+            qualities[QUALITIES[sign]] += w
+
+    # Добавляем Асцендент
+    asc = chart.get('ascendant', '')
+    if asc in ELEMENTS:
+        elements[ELEMENTS[asc]] += 2
+    if asc in QUALITIES:
+        qualities[QUALITIES[asc]] += 2
+
+    dominant_element = max(elements, key=elements.get)
+    weak_element = min(elements, key=elements.get)
+    dominant_quality = max(qualities, key=qualities.get)
+
+    return {
+        'elements': elements,
+        'qualities': qualities,
+        'dominant_element': dominant_element,
+        'weak_element': weak_element,
+        'dominant_quality': dominant_quality,
+    }
 
 
 # ── Вспомогательные ───────────────────────────────────────────────────────────
@@ -207,9 +351,13 @@ def _meeus_fallback(year, month, day, hour, minute, lat, lon, city, timezone) ->
             'ruler':   SIGN_RULERS.get(sign, '?'),
         }
 
+    # Рассчитываем аспекты
+    aspects = calculate_aspects(planets)
+
     return {
         'planets':    planets,
         'houses':     houses,
+        'aspects':    aspects,
         'ascendant':  asc_sign,
         'asc_degree': asc_deg,
         'sun_sign':   planets['Sun']['sign'],
@@ -223,10 +371,6 @@ def _meeus_fallback(year, month, day, hour, minute, lat, lon, city, timezone) ->
 # ── Kerykeion (точный расчёт) ────────────────────────────────────────────────
 
 def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) -> Dict:
-    """
-    Точный расчёт через kerykeion (Swiss Ephemeris).
-    kerykeion использует объекты с атрибутами, а не словари!
-    """
     from kerykeion import AstrologicalSubject
 
     subject = AstrologicalSubject(
@@ -234,7 +378,6 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
         lat=lat, lng=lon, tz_str=timezone, city=city
     )
 
-    # Маппинг имён атрибутов kerykeion
     PLANET_ATTRS = {
         'Sun': 'sun', 'Moon': 'moon', 'Mercury': 'mercury',
         'Venus': 'venus', 'Mars': 'mars', 'Jupiter': 'jupiter',
@@ -247,7 +390,6 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
         obj = getattr(subject, attr_name, None)
         if obj is None:
             continue
-        # kerykeion объекты имеют атрибуты: sign, abs_pos, position, house, retrograde
         sign_en = getattr(obj, 'sign', None)
         abs_pos = getattr(obj, 'abs_pos', 0.0)
         position = getattr(obj, 'position', abs_pos % 30)
@@ -263,7 +405,6 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
             'retrograde':  retro,
         }
 
-    # Асцендент — берём из first_house объекта kerykeion
     asc_sign = '?'
     asc_degree = 0.0
     first_house = getattr(subject, 'first_house', None)
@@ -272,7 +413,6 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
         asc_sign = translate_sign(asc_sign_en) if asc_sign_en else '?'
         asc_degree = round(getattr(first_house, 'position', 0.0), 1)
 
-    # Дома — kerykeion предоставляет house_list или отдельные атрибуты
     HOUSE_ATTRS = [
         'first_house', 'second_house', 'third_house', 'fourth_house',
         'fifth_house', 'sixth_house', 'seventh_house', 'eighth_house',
@@ -298,9 +438,13 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
             'ruler':   SIGN_RULERS.get(h_sign, '?'),
         }
 
+    # Рассчитываем аспекты
+    aspects = calculate_aspects(planets)
+
     return {
         'planets':    planets,
         'houses':     houses,
+        'aspects':    aspects,
         'ascendant':  asc_sign,
         'asc_degree': asc_degree,
         'sun_sign':   planets.get('Sun', {}).get('sign', '?'),
@@ -313,17 +457,6 @@ def _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone) ->
 # ── Основная функция ─────────────────────────────────────────────────────────
 
 def get_sun_sign(day: int, month: int) -> str:
-    """Знак Солнца по дате (упрощённо, без года)."""
-    zodiac = [
-        (1, 20, 'Козерог'), (2, 19, 'Водолей'), (3, 20, 'Рыбы'),
-        (4, 20, 'Овен'), (5, 21, 'Телец'), (6, 21, 'Близнецы'),
-        (7, 22, 'Рак'), (8, 23, 'Лев'), (9, 23, 'Дева'),
-        (10, 23, 'Весы'), (11, 22, 'Скорпион'), (12, 22, 'Стрелец'),
-    ]
-    for m, d, sign in zodiac:
-        if (month == m and day <= d) or (month == m - 1 and day > 0):
-            pass
-    # Более простая логика
     dates = [
         (120, 'Козерог'), (219, 'Водолей'), (320, 'Рыбы'),
         (420, 'Овен'), (521, 'Телец'), (621, 'Близнецы'),
@@ -344,11 +477,6 @@ def calculate_natal_chart(
     city: str = "Unknown",
     timezone: str = "UTC"
 ) -> Dict:
-    """
-    Полная натальная карта (западная астрология).
-    Приоритет: kerykeion (Swiss Ephemeris) → Meeus fallback.
-    """
-    # Попытка kerykeion
     try:
         result = _kerykeion_calc(year, month, day, hour, minute, lat, lon, city, timezone)
         logger.info("Натальная карта рассчитана через kerykeion (Swiss Ephemeris)")
@@ -356,14 +484,12 @@ def calculate_natal_chart(
     except Exception as e:
         logger.warning(f"Kerykeion недоступен ({e}), переключаюсь на формулы Мееуса")
 
-    # Fallback
     return _meeus_fallback(year, month, day, hour, minute, lat, lon, city, timezone)
 
 
 # ── Текущие транзиты ──────────────────────────────────────────────────────────
 
 def get_current_transits(date: datetime = None) -> Dict:
-    """Текущие позиции планет для транзитного анализа."""
     if date is None:
         date = datetime.utcnow()
 
@@ -394,7 +520,6 @@ def get_current_transits(date: datetime = None) -> Dict:
                 }
         return transits
     except Exception:
-        # Meeus fallback для транзитов
         h_float = date.hour + date.minute / 60.0
         sun_lon = _sun_longitude(date.year, date.month, date.day, h_float)
         moon_lon = _moon_longitude_meeus(date.year, date.month, date.day, h_float)
@@ -413,7 +538,6 @@ def get_current_transits(date: datetime = None) -> Dict:
 
 
 def format_transits_text(transits: Dict) -> str:
-    """Форматирование текущих транзитов для промпта."""
     lines = []
     for key in ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars',
                 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto']:
@@ -432,7 +556,6 @@ def get_transits(chart: Dict, date: datetime = None) -> List[Dict]:
 # ── Форматирование ────────────────────────────────────────────────────────────
 
 def format_chart_text(chart: Dict, birth_info: Dict = None) -> str:
-    """Краткое текстовое представление карты."""
     if birth_info is None:
         birth_info = {}
     lines = [
@@ -448,7 +571,6 @@ def format_chart_text(chart: Dict, birth_info: Dict = None) -> str:
 
 
 def format_full_chart_text(chart: Dict) -> str:
-    """Полный текст карты: планеты + 12 домов."""
     lines = ["🪐 <b>Планеты:</b>"]
     for key in ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars',
                 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto']:
@@ -470,6 +592,14 @@ def format_full_chart_text(chart: Dict) -> str:
         lines.append(f"  Знак: {h['sign']}{ruler}")
         lines.append(f"  {h['meaning']}")
 
+    # Аспекты
+    aspects = chart.get('aspects', [])
+    if aspects:
+        lines += ["", "🔗 <b>Аспекты:</b>"]
+        for a in aspects:
+            nature_icon = "✅" if "гармоничный" in a['nature'] else "⚡" if "напряжённый" in a['nature'] else "🔵"
+            lines.append(f"  {nature_icon} {a['planet1']} {a['aspect']} {a['planet2']} (орбис {a['orb']}°)")
+
     if chart.get('source') == 'meeus':
         lines += ["", f"⚠️ {chart.get('warning', '')}"]
     elif chart.get('source') == 'kerykeion':
@@ -480,7 +610,7 @@ def format_full_chart_text(chart: Dict) -> str:
 # ── Промпты для AI ────────────────────────────────────────────────────────────
 
 def build_natal_summary(chart: Dict) -> str:
-    """Сводка натальной карты для использования в системном промпте AI."""
+    """Расширенная сводка натальной карты для AI-промпта."""
     lines = [f"Асцендент: {chart.get('ascendant', '?')}"]
     for key in ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars',
                 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto']:
@@ -488,7 +618,35 @@ def build_natal_summary(chart: Dict) -> str:
         if p:
             retro = " (ретро)" if p.get('retrograde') else ""
             lines.append(f"{p['name']}: {p['sign']}, Дом {p.get('house', '?')}{retro}")
+
+    # Аспекты
+    aspects = chart.get('aspects', [])
+    if aspects:
+        lines.append("\nАспекты:")
+        for a in aspects:
+            lines.append(f"  {a['planet1']} {a['aspect']} {a['planet2']} ({a['nature']}, орбис {a['orb']}°)")
+
+    # Баланс стихий
+    balance = analyze_element_balance(chart)
+    lines.append(f"\nДоминирующая стихия: {balance['dominant_element']}")
+    lines.append(f"Слабая стихия: {balance['weak_element']}")
+    lines.append(f"Доминирующий крест: {balance['dominant_quality']}")
+    el = balance['elements']
+    lines.append(f"Баланс стихий: Огонь={el['Огонь']}, Земля={el['Земля']}, Воздух={el['Воздух']}, Вода={el['Вода']}")
+
     return "\n".join(lines)
+
+
+def build_natal_summary_short(chart: Dict) -> str:
+    """Краткая сводка для inline-ответов."""
+    lines = []
+    for key in ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars']:
+        p = chart.get('planets', {}).get(key)
+        if p:
+            retro = " ℞" if p.get('retrograde') else ""
+            lines.append(f"{p['name']}: {p['sign']}{retro}")
+    lines.append(f"Асцендент: {chart.get('ascendant', '?')}")
+    return ", ".join(lines)
 
 
 def build_houses_prompt(chart: Dict, user_name: str = "пользователь") -> str:
@@ -532,7 +690,7 @@ def build_partner_prompt(chart: Dict, name: str) -> str:
 # ── Совместимость ─────────────────────────────────────────────────────────────
 
 def calculate_compatibility(chart1: Dict, chart2: Dict) -> Dict:
-    """Базовая синастрия по знакам и стихиям."""
+    """Расширенная синастрия: стихии + аспекты между картами."""
     score   = 0
     aspects = []
 
@@ -576,7 +734,19 @@ def calculate_compatibility(chart1: Dict, chart2: Dict) -> Dict:
     if moon1 == asc2 or moon2 == asc1:
         score += 10; aspects.append("🌙 Луна одного совпадает с Асцендентом другого — эмоциональная поддержка")
 
-    score = min(score, 100)
+    # Межкартные аспекты (если есть данные планет)
+    p1 = chart1.get('planets', {})
+    p2 = chart2.get('planets', {})
+    if p1 and p2:
+        cross_aspects = calculate_transit_aspects(p1, p2)
+        harmonious = sum(1 for a in cross_aspects if 'гармоничный' in a['nature'])
+        tense = sum(1 for a in cross_aspects if 'напряжённый' in a['nature'])
+        score += harmonious * 3
+        score -= tense * 1
+        if cross_aspects:
+            aspects.append(f"🔗 Межкартных аспектов: {len(cross_aspects)} (гармоничных: {harmonious}, напряжённых: {tense})")
+
+    score = max(0, min(score, 100))
     if score >= 70:   level, emoji = "Высокая",  "💚"
     elif score >= 45: level, emoji = "Хорошая",  "💛"
     elif score >= 25: level, emoji = "Средняя",  "🧡"
@@ -590,8 +760,11 @@ def build_compatibility_prompt(chart1: Dict, chart2: Dict,
     lines = [
         "Ты астролог. Дай развёрнутый анализ совместимости пары (западная астрология, синастрия).",
         "",
-        f"{name1}: Солнце {chart1.get('sun_sign')}, Луна {chart1.get('moon_sign')}, Асц {chart1.get('ascendant')}",
-        f"{name2}: Солнце {chart2.get('sun_sign')}, Луна {chart2.get('moon_sign')}, Асц {chart2.get('ascendant')}",
+        f"{name1}:",
+        build_natal_summary(chart1),
+        "",
+        f"{name2}:",
+        build_natal_summary(chart2),
         "",
         f"Балл совместимости: {compat['score']}% ({compat['level']})",
         "",
