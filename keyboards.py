@@ -1,21 +1,20 @@
 """
-Клавиатуры бота.
+Клавиатуры для Telegram-бота.
+Обновлено: «Астропрофиль» вместо «Партнёры», кнопка «Расклад Таро».
 """
 
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 
 
-# ── Reply-клавиатуры ──────────────────────────────────────────────────────────
-
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔮 Моя карта"),     KeyboardButton(text="📅 Прогноз")],
-            [KeyboardButton(text="👥 Люди"),           KeyboardButton(text="📍 Мой регион")],
-            [KeyboardButton(text="⚙️ Настройки"),     KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="🔮 Моя карта"), KeyboardButton(text="📅 Прогноз")],
+            [KeyboardButton(text="🪐 Астропрофиль"), KeyboardButton(text="📍 Мой регион")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True
     )
@@ -25,7 +24,7 @@ def settings_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="✏️ Изменить данные")],
-            [KeyboardButton(text="📜 История"), KeyboardButton(text="🔙 Назад")],
+            [KeyboardButton(text="🔙 Назад")],
         ],
         resize_keyboard=True
     )
@@ -38,70 +37,90 @@ def cancel_menu() -> ReplyKeyboardMarkup:
     )
 
 
-def remove() -> ReplyKeyboardRemove:
-    return ReplyKeyboardRemove()
-
-
-# ── Инлайн: выбор периода прогноза ───────────────────────────────────────────
-
 def forecast_period_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📆 Сегодня",     callback_data="forecast:today"),
-            InlineKeyboardButton(text="📅 Завтра",      callback_data="forecast:tomorrow"),
+            InlineKeyboardButton(text="Сегодня", callback_data="forecast:today"),
+            InlineKeyboardButton(text="Завтра", callback_data="forecast:tomorrow"),
         ],
         [
-            InlineKeyboardButton(text="🗓 Эта неделя",  callback_data="forecast:week"),
-            InlineKeyboardButton(text="📅 Этот месяц",  callback_data="forecast:month"),
+            InlineKeyboardButton(text="Неделя", callback_data="forecast:week"),
+            InlineKeyboardButton(text="Месяц", callback_data="forecast:month"),
         ],
-        [
-            InlineKeyboardButton(text="✏️ Своя дата",  callback_data="forecast:custom"),
-        ],
+        [InlineKeyboardButton(text="📅 Выбрать дату", callback_data="forecast:custom")],
     ])
 
 
-# ── Инлайн: список людей ──────────────────────────────────────────────────
+# ── Астропрофиль ──────────────────────────────────────────────────────────────
+
+def profile_select_kb(partners: list) -> InlineKeyboardMarkup:
+    """Клавиатура выбора профиля: свой + список людей + добавить."""
+    buttons = [
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile:self")],
+    ]
+    for p in partners:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"👤 {p.get('name', '?')}",
+                callback_data=f"profile:person:{p['id']}"
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить человека", callback_data="partner:add")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ── Партнёры (для обратной совместимости) ─────────────────────────────────────
 
 def partners_list_kb(partners: list) -> InlineKeyboardMarkup:
-    """Кнопка на каждого человека + добавить нового."""
-    rows = []
+    buttons = []
     for p in partners:
-        rows.append([InlineKeyboardButton(
-            text=f"👤 {p['name']}  ({p.get('birth_date', '?')})",
-            callback_data=f"partner:view:{p['id']}"
-        )])
-    rows.append([InlineKeyboardButton(
-        text="➕ Добавить человека",
-        callback_data="partner:add"
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"👤 {p.get('name', '?')}",
+                callback_data=f"partner:view:{p['id']}"
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить", callback_data="partner:add")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def no_partners_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="➕ Добавить человека", callback_data="partner:add")
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить человека", callback_data="partner:add")]
+    ])
 
-
-# ── Инлайн: меню конкретного человека ────────────────────────────────────────
 
 def partner_actions_kb(partner_id: int) -> InlineKeyboardMarkup:
-    """Что можно сделать с выбранным человеком."""
-    pid = str(partner_id)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💑 Совместимость",      callback_data=f"partner:compat:{pid}")],
-        [InlineKeyboardButton(text="🔮 Натальная карта",    callback_data=f"partner:natal:{pid}")],
-        [InlineKeyboardButton(text="📅 Прогноз для него",   callback_data=f"partner:forecast:{pid}")],
-        [InlineKeyboardButton(text="🗑 Удалить профиль",   callback_data=f"partner:delete:{pid}")],
-        [InlineKeyboardButton(text="◀️ Назад к списку",     callback_data="partner:list")],
+        [
+            InlineKeyboardButton(text="💑 Совместимость", callback_data=f"partner:compat:{partner_id}"),
+            InlineKeyboardButton(text="🔮 Карта", callback_data=f"partner:natal:{partner_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="📅 Прогноз", callback_data=f"partner:forecast:{partner_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"partner:delete:{partner_id}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="partner:list")],
     ])
 
 
 def confirm_delete_kb(partner_id: int) -> InlineKeyboardMarkup:
-    pid = str(partner_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"partner:confirm_delete:{pid}"),
-            InlineKeyboardButton(text="❌ Отмена",       callback_data=f"partner:view:{pid}"),
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"partner:confirm_delete:{partner_id}"),
+            InlineKeyboardButton(text="❌ Нет", callback_data=f"partner:view:{partner_id}"),
         ]
+    ])
+
+
+# ── Таро ──────────────────────────────────────────────────────────────────────
+
+def tarot_button() -> InlineKeyboardMarkup:
+    """Кнопка «Расклад Таро» под сообщением бота."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🃏 Расклад Таро", callback_data="tarot:spread")]
     ])
