@@ -1,12 +1,14 @@
 """
-Telegram бот астролог + Таро.
+Telegram бот астролог.
 
 Возможности:
   1. Натальная карта через kerykeion (Swiss Ephemeris) — точный расчёт.
   2. Прогнозы на день/неделю/месяц с учётом транзитов.
-  3. Астропрофиль: свои данные + данные других людей.
-  4. Свободный AI-диалог: персонализированный астрологический ассистент.
-  5. Таро: расклады, Аркан дня, синтез с астрологией.
+  3. Астропрофили: «Я» + другие люди, взаимодействие между ними.
+  4. Свободный AI-диалог: персонализированный ассистент,
+     который знает натальные карты, текущие транзиты,
+     и даёт индивидуальные советы.
+  5. Расклады Таро через текстовый диалог (синергия с астрологией).
 """
 
 import os
@@ -14,7 +16,6 @@ import sys
 import asyncio
 import logging
 import re
-import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -34,17 +35,12 @@ from astro_engine import (
     build_compatibility_prompt, get_transits, calculate_compatibility,
     build_natal_summary, get_current_transits, format_transits_text,
 )
-from tarot_engine import (
-    draw_cards, draw_single_arcana, format_card, format_spread,
-    build_tarot_prompt_for_astro, build_arcana_day_prompt,
-)
 from database import AstroDatabase
 from keyboards import (
     main_menu, settings_menu, cancel_menu,
     forecast_period_kb,
-    partners_list_kb, no_partners_kb,
-    partner_actions_kb, confirm_delete_kb,
-    tarot_button, profile_select_kb,
+    astroprofile_list_kb, no_profiles_kb,
+    profile_actions_kb, confirm_delete_kb,
 )
 
 load_dotenv()
@@ -75,11 +71,8 @@ db          = AstroDatabase()
 MAX_HISTORY = 20
 chat_histories: dict[int, list[dict]] = defaultdict(list)
 
-# ── Контекст для кнопок «Подробнее» и «Таро» ────────────────────────────────
-# Хранит последний ответ бота для каждого пользователя
-last_bot_context: dict[int, dict] = {}
-# Хранит выбранный профиль (None = свой, partner_id = чужой)
-active_profile: dict[int, int | None] = {}
+# ── Активный астропрофиль (user_id → {"type": "self"} или {"type": "other", "id": ..., "name": ..., "chart": ...})
+active_profiles: dict[int, dict] = {}
 
 # ── TimezoneFinder ────────────────────────────────────────────────────────────
 _tf = None
@@ -105,7 +98,7 @@ class Registration(StatesGroup):
     city = State()
 
 
-class PartnerAdd(StatesGroup):
+class ProfileAdd(StatesGroup):
     name = State()
     date = State()
     time = State()
@@ -190,6 +183,16 @@ def validate_time(text: str) -> tuple:
     return True, "", f"{h:02d}:{mn:02d}"
 
 
+def _deduplicate_name(existing_names: list[str], desired_name: str) -> str:
+    """Если имя уже есть — добавить цифру: Саша → Саша1, Саша2..."""
+    if desired_name not in existing_names:
+        return desired_name
+    i = 1
+    while f"{desired_name}{i}" in existing_names:
+        i += 1
+    return f"{desired_name}{i}"
+
+
 async def ask_groq(prompt: str, max_tokens: int = 1200) -> str | None:
     if not groq_client:
         return None
@@ -229,53 +232,127 @@ async def send_long(message: types.Message, text: str, **kwargs):
         await message.answer(text[i:i + 4000], **kwargs)
 
 
-def _get_astro_context(user: dict) -> tuple[str, str, str]:
-    """Возвращает (natal_summary, transits_text, current_city)."""
+def _get_active_profile_info(user_id: int) -> dict | None:
+    """Возвращает информацию об активном профиле или None."""
+    return active_profiles.get(user_id)
+
+
+def _build_system_prompt(user: dict, profile_info: dict | None = None) -> str:
+    """
+    Строит системный промпт для персонализированного AI-ассистента.
+    Учитывает активный астропрофиль для правильного обращения.
+    """
     chart = user.get('chart', {})
-    natal_summary = build_natal_summary(chart)
+    user_natal_summary = build_natal_summary(chart)
+    user_name = user.get('first_name') or 'пользователь'
+
+    current_city = user.get('current_city') or user.get('city', 'не указан')
+    current_tz = user.get('current_timezone') or user.get('timezone', 'UTC')
+
+    # Текущие транзиты
     try:
         transits = get_current_transits()
         transits_text = format_transits_text(transits)
     except Exception:
         transits_text = "(транзиты недоступны)"
-    current_city = user.get('current_city') or user.get('city', 'не указан')
-    return natal_summary, transits_text, current_city
 
-
-def _build_system_prompt(user: dict) -> str:
-    chart = user.get('chart', {})
-    natal_summary, transits_text, current_city = _get_astro_context(user)
-    current_tz = user.get('current_timezone') or user.get('timezone', 'UTC')
     now = datetime.now()
 
-    system_prompt = f"""Ты — профессиональный астролог-консультант с глубокими знаниями западной астрологии.
-Ты ведёшь персональный диалог с человеком, чью натальную карту ты знаешь.
+    # Определяем контекст обращения
+    if profile_info and profile_info.get("type") == "other":
+        target_name = profile_info["name"]
+        target_chart = profile_info.get("chart", {})
+        target_natal = build_natal_summary(target_chart)
+        addressing_rules = f"""═══ РЕЖИМ: АНАЛИЗ ДРУГОГО ЧЕЛОВЕКА ═══
+Ты анализируешь человека по имени {target_name}.
+Натальная карта {target_name}:
+{target_natal}
 
-═══ НАТАЛЬНАЯ КАРТА КЛИЕНТА ═══
-{natal_summary}
+Солнечный знак: {target_chart.get('sun_sign', '?')}
+Лунный знак: {target_chart.get('moon_sign', '?')}
+Асцендент: {target_chart.get('ascendant', '?')}
+
+ПРАВИЛА ОБРАЩЕНИЯ:
+- Говори о {target_name} в ТРЕТЬЕМ ЛИЦЕ: "{target_name} сегодня...", "Ему/ей рекомендуется..."
+- ВСЕ прогнозы, расклады и советы — для {target_name}, НЕ для пользователя.
+- Пользователь спрашивает о {target_name}, отвечай про {target_name}.
+
+Натальная карта пользователя (для контекста взаимодействий):
+{user_natal_summary}
+"""
+    else:
+        # Режим «Я» — обращение во втором лице
+        target_name = user_name
+        addressing_rules = f"""═══ РЕЖИМ: ЛИЧНЫЙ ПРОФИЛЬ ═══
+Ты обращаешься к пользователю напрямую, во ВТОРОМ ЛИЦЕ.
+Пример: "Вам сегодня рекомендуется...", "У вас сейчас транзит..."
+
+Натальная карта пользователя:
+{user_natal_summary}
 
 Солнечный знак: {chart.get('sun_sign', '?')}
 Лунный знак: {chart.get('moon_sign', '?')}
 Асцендент: {chart.get('ascendant', '?')}
+"""
+
+    # Собираем список всех астропрофилей для возможных взаимодействий
+    profiles_context = ""
+    try:
+        partners = db.get_partners(user.get('user_id', 0))
+        if partners:
+            names = [p['name'] for p in partners]
+            profiles_context = f"\n═══ ДОСТУПНЫЕ АСТРОПРОФИЛИ ═══\nЛюди в астропрофилях пользователя: {', '.join(names)}\nПользователь может спросить о взаимодействии между ними или попросить расклад на кого-то из них.\n"
+    except Exception:
+        pass
+
+    system_prompt = f"""Ты — профессиональный астролог-консультант и таролог с глубокими знаниями западной астрологии и Таро.
+Ты ведёшь персональный диалог.
+
+{addressing_rules}
 
 ═══ ТЕКУЩАЯ АСТРОЛОГИЧЕСКАЯ ОБСТАНОВКА ═══
 Дата: {now.strftime('%d.%m.%Y')}, время: {now.strftime('%H:%M')} UTC
 Текущие транзиты планет:
 {transits_text}
-
-═══ МЕСТОПОЛОЖЕНИЕ КЛИЕНТА ═══
+{profiles_context}
+═══ МЕСТОПОЛОЖЕНИЕ ═══
 Регион: {current_city} (часовой пояс: {current_tz})
 
 ═══ ПРАВИЛА ПОВЕДЕНИЯ ═══
-1. Ты ВСЕГДА опираешься на натальную карту клиента при ответах.
-2. Ты учитываешь текущие транзиты и их аспекты к натальным планетам.
-3. Ты даёшь строго ИНДИВИДУАЛЬНЫЕ советы — не общие гороскопы.
-4. Отвечай КРАТКО и ДРУЖЕЛЮБНО — как друг-астролог. Используй эмодзи.
-5. НЕ упоминай планеты, аспекты, дома в основном ответе — просто дай совет.
-6. Если предстоит трудный период — предупреди мягко, поддержи, скажи когда наладится.
-7. Длина ответа: 50–200 слов максимум. Кратко и по делу.
-8. Отвечай на русском языке.
-9. Не используй HTML-разметку — обычный текст с эмодзи."""
+1. ВСЕГДА опирайся на натальную карту при ответах.
+2. Учитывай текущие транзиты и их аспекты к натальным планетам.
+3. Давай строго ИНДИВИДУАЛЬНЫЕ советы — не общие гороскопы.
+4. Если спрашивают о ситуации (бизнес, отношения, здоровье),
+   анализируй задействованные дома и планеты, давай конкретный совет.
+5. Для выбора оптимального времени — подбирай на основе транзитов и натальной карты.
+6. Тон: тёплый, но профессиональный. Конкретные рекомендации.
+7. Отвечай на русском языке.
+8. Не используй HTML-разметку, пиши текстом с эмодзи.
+9. Если спрашивают не по астрологии/Таро — мягко направь разговор обратно.
+10. Длина ответа: 150–400 слов.
+
+═══ РАСКЛАДЫ ТАРО ═══
+- Если пользователь просит расклад Таро, делай его.
+- Выбирай карты (3-7 карт в зависимости от вопроса), описывай каждую.
+- ОБЯЗАТЕЛЬНО трактуй карты в СИНЕРГИИ с астрологическим профилем и текущими транзитами.
+- Пример: если у человека хороший день для путешествий по транзитам и выпала Колесница или Мир —
+  укажи что это взаимно усиливает значение и дай уверенный совет.
+- Если карты противоречат астрологии — объясни нюансы.
+
+═══ ВЗАИМОДЕЙСТВИЕ ПРОФИЛЕЙ ═══
+- Если пользователь упоминает имя из астропрофилей, анализируй взаимодействие
+  между натальными картами (синастрия), давай советы по отношениям.
+- Используй карты Таро для углублённого анализа взаимодействий.
+
+═══ ОБЯЗАТЕЛЬНО В КОНЦЕ КАЖДОГО ОТВЕТА ═══
+Всегда завершай ответ предложением — что ещё можно посмотреть или сделать.
+Примеры:
+- "Хотите разобрать эту ситуацию подробнее с помощью расклада Таро? 🃏"
+- "Могу посмотреть, какой период будет наиболее благоприятным для этого дела ⏰"
+- "Хотите узнать, как текущие транзиты влияют на вашу карьеру? 💼"
+- "Могу сделать расклад на совместимость с кем-то из ваших астропрофилей 💑"
+Предложение должно быть КОНТЕКСТНЫМ — связано с темой разговора.
+"""
 
     return system_prompt
 
@@ -288,6 +365,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user = db.get_user(message.from_user.id)
     if user:
         chart = user.get('chart', {})
+        # При старте — активный профиль «Я»
+        active_profiles[message.from_user.id] = {"type": "self"}
         await message.answer(
             f"✨ С возвращением, {user.get('first_name') or 'друг'}!\n"
             f"Твой знак: {chart.get('sun_sign', '?')}\n\n"
@@ -380,7 +459,9 @@ async def reg_city(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+    # Очистить историю чата и установить профиль «Я»
     chat_histories.pop(message.from_user.id, None)
+    active_profiles[message.from_user.id] = {"type": "self"}
 
     chart_text = format_chart_text(chart, {'city': geo["display_name"]})
     await msg.edit_text(
@@ -458,7 +539,11 @@ async def forecast_custom_date(message: types.Message, state: FSMContext):
 
 async def _do_forecast(message: types.Message, user_id: int,
                         period: str, custom_date: str = None,
-                        chart_override: dict = None, location_override: str = None):
+                        chart_override: dict = None, location_override: str = None,
+                        target_name: str = None):
+    """
+    Прогноз. Если target_name задан — прогноз для третьего лица.
+    """
     user  = db.get_user(user_id)
     if not user:
         return
@@ -494,8 +579,23 @@ async def _do_forecast(message: types.Message, user_id: int,
     except Exception:
         transits_text = ""
 
+    # Обращение: второе или третье лицо
+    if target_name:
+        addressing = (
+            f"Прогноз для {target_name} (третье лицо). "
+            f"Пиши: '{target_name} сегодня...', 'Ему/ей рекомендуется...'. "
+            f"В конце предложи посмотреть что-то ещё о {target_name}."
+        )
+    else:
+        addressing = (
+            "Прогноз для пользователя (второе лицо). "
+            "Пиши: 'Вам сегодня...', 'Вам рекомендуется...'. "
+            "В конце предложи что-то ещё — расклад Таро, подробный анализ аспектов и т.д."
+        )
+
     prompt = (
         f"Ты астролог. Составь прогноз на {date_label}.\n\n"
+        f"{addressing}\n\n"
         f"Натальная карта:\n{build_natal_summary(chart)}\n\n"
         f"Текущие транзиты:\n{transits_text}\n\n"
         f"Текущее местоположение: {current_city} (часовой пояс: {current_tz})\n\n"
@@ -506,181 +606,154 @@ async def _do_forecast(message: types.Message, user_id: int,
 
     result = await ask_groq(prompt, max_tokens=1500)
     if result:
-        # Сохраняем контекст для кнопки «Расклад Таро»
-        last_bot_context[user_id] = {
-            "type": "forecast",
-            "period": period,
-            "response": result,
-            "chart": chart,
-        }
-        await msg.edit_text(result, reply_markup=tarot_button())
+        await msg.edit_text(result, parse_mode=ParseMode.HTML)
     else:
         await msg.edit_text("⚠️ Не удалось получить прогноз. Попробуй позже.")
 
 
-# ── Астропрофиль (замена «Партнёры») ─────────────────────────────────────────
+# ── Астропрофили ──────────────────────────────────────────────────────────────
 
-@dp.message(F.text == "🪐 Астропрофиль")
-async def astro_profile_menu(message: types.Message):
+@dp.message(F.text == "🌟 Астропрофиль")
+async def astroprofile_menu(message: types.Message):
     user = db.get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала введи свои данные рождения:", reply_markup=settings_menu())
         return
 
     partners = db.get_partners(message.from_user.id)
-    chart = user.get('chart', {})
+    user_name = user.get('first_name') or 'Пользователь'
 
-    # Сбрасываем активный профиль на «свой»
-    active_profile[message.from_user.id] = None
-
-    text = (
-        f"🪐 <b>Астропрофиль</b>\n\n"
-        f"👤 <b>Ты</b>: ☉ {chart.get('sun_sign', '?')} · "
-        f"☽ {chart.get('moon_sign', '?')} · ↑ {chart.get('ascendant', '?')}\n\n"
-    )
-    if partners:
-        text += f"👥 Сохранённые люди: {len(partners)}\n"
-        text += "Выбери профиль для вопросов и раскладов:"
-    else:
-        text += "Добавь людей, чтобы смотреть их данные и совместимость."
-
+    # Формируем список: первый — «Я», потом остальные
     await message.answer(
-        text,
+        f"🌟 <b>Астропрофили</b>\n\n"
+        f"Выберите профиль для работы.\n"
+        f"«Я» — ваш личный профиль.\n"
+        f"Остальные — добавленные вами люди.",
         parse_mode=ParseMode.HTML,
-        reply_markup=profile_select_kb(partners)
+        reply_markup=astroprofile_list_kb(user_name, partners)
     )
-
-
-# Обработка «Партнёры» для обратной совместимости
-@dp.message(F.text == "👥 Партнёры")
-async def partners_redirect(message: types.Message):
-    await astro_profile_menu(message)
 
 
 @dp.callback_query(F.data == "profile:self")
 async def profile_select_self(callback: types.CallbackQuery):
-    await callback.answer("Выбран твой профиль ✨")
-    active_profile[callback.from_user.id] = None
+    """Выбор своего профиля «Я»."""
+    await callback.answer()
     user = db.get_user(callback.from_user.id)
-    chart = user.get('chart', {})
+    if not user:
+        return
+
+    user_name = user.get('first_name') or 'Пользователь'
+    active_profiles[callback.from_user.id] = {"type": "self"}
+    # Очистить историю чата при смене профиля
+    chat_histories.pop(callback.from_user.id, None)
+
     await callback.message.edit_text(
-        f"🪐 <b>Активный профиль: Ты</b>\n\n"
-        f"☉ {chart.get('sun_sign', '?')} · ☽ {chart.get('moon_sign', '?')} · ↑ {chart.get('ascendant', '?')}\n\n"
-        f"Теперь все вопросы и расклады будут для тебя.\n"
-        f"Просто напиши вопрос или попроси расклад! 🔮",
+        f"🌟 <b>{user_name}</b>, вы выбрали свой астропрофиль.\n\n"
+        f"Что бы вы хотели посмотреть сейчас? Можете задать любой вопрос "
+        f"по астрологии или попросить расклад Таро 🔮🃏",
         parse_mode=ParseMode.HTML
     )
 
 
-@dp.callback_query(F.data.startswith("profile:person:"))
-async def profile_select_person(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("profile:view:"))
+async def profile_select_other(callback: types.CallbackQuery):
+    """Выбор чужого профиля."""
     pid = int(callback.data.split(":")[2])
+    await callback.answer()
+
+    user = db.get_user(callback.from_user.id)
     partners = db.get_partners(callback.from_user.id)
     p = next((x for x in partners if x['id'] == pid), None)
     if not p:
-        await callback.answer("❌ Не найден")
+        await callback.message.answer("❌ Профиль не найден.")
         return
 
-    await callback.answer(f"Выбран профиль: {p['name']}")
-    active_profile[callback.from_user.id] = pid
     chart = p.get('chart', {})
+    name = p.get('name', '?')
+
+    # Установить активный профиль
+    active_profiles[callback.from_user.id] = {
+        "type": "other",
+        "id": pid,
+        "name": name,
+        "chart": chart,
+    }
+    # Очистить историю чата при смене профиля
+    chat_histories.pop(callback.from_user.id, None)
+
+    brief = (
+        f"☉ {chart.get('sun_sign', '?')} · "
+        f"☽ {chart.get('moon_sign', '?')} · "
+        f"↑ {chart.get('ascendant', '?')}"
+    )
+
     await callback.message.edit_text(
-        f"🪐 <b>Активный профиль: {p['name']}</b>\n\n"
-        f"☉ {chart.get('sun_sign', '?')} · ☽ {chart.get('moon_sign', '?')} · ↑ {chart.get('ascendant', '?')}\n\n"
-        f"Теперь вопросы и расклады учитывают данные {p['name']}.\n"
-        f"Просто напиши вопрос или попроси расклад! 🔮",
+        f"🌟 Вы выбрали <b>{name}</b> ({brief}).\n\n"
+        f"Можете задать интересующий вопрос о {name}. "
+        f"Например, попросите прогноз, расклад Таро или анализ совместимости 🔮",
         parse_mode=ParseMode.HTML,
-        reply_markup=partner_actions_kb(pid)
+        reply_markup=profile_actions_kb(pid)
     )
 
 
-@dp.callback_query(F.data.startswith("partner:view:"))
-async def partner_view(callback: types.CallbackQuery):
-    pid      = int(callback.data.split(":")[2])
-    partners = db.get_partners(callback.from_user.id)
-    p        = next((x for x in partners if x['id'] == pid), None)
+@dp.callback_query(F.data == "profile:add")
+async def profile_add_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    if not p:
-        await callback.message.answer("❌ Не найден.")
-        return
-
-    chart = p.get('chart', {})
-    text  = (
-        f"👤 <b>{p['name']}</b>\n\n"
-        f"📅 Дата: {p.get('birth_date', '?')}\n"
-        f"🌍 Город: {p.get('city', '?')}\n"
-        f"☉ Солнце: {chart.get('sun_sign', '?')}\n"
-        f"☽ Луна: {chart.get('moon_sign', '?')}\n"
-        f"↑ Асц: {chart.get('ascendant', '?')}"
-    )
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML,
-                                      reply_markup=partner_actions_kb(pid))
-
-
-@dp.callback_query(F.data == "partner:list")
-async def partner_back_list(callback: types.CallbackQuery):
-    await callback.answer()
-    partners = db.get_partners(callback.from_user.id)
-    if partners:
-        await callback.message.edit_text(
-            f"👥 <b>Люди</b> — {len(partners)} чел.\n\nВыбери кого-нибудь:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=partners_list_kb(partners)
-        )
-    else:
-        await callback.message.edit_text(
-            "👥 Список людей пуст.",
-            reply_markup=no_partners_kb()
-        )
-
-
-@dp.callback_query(F.data == "partner:add")
-async def partner_add_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.set_state(PartnerAdd.name)
+    await state.set_state(ProfileAdd.name)
     await callback.message.answer("Как зовут человека? (имя или прозвище)",
                                    reply_markup=cancel_menu())
 
 
-@dp.message(PartnerAdd.name)
-async def partner_add_name(message: types.Message, state: FSMContext):
+@dp.message(ProfileAdd.name)
+async def profile_add_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
     if not name:
         await message.answer("❌ Введи имя:")
         return
-    await state.update_data(partner_name=name)
-    await state.set_state(PartnerAdd.date)
-    await message.answer(f"Дата рождения {name}:\n<code>ДД.ММ.ГГГГ</code>",
+
+    # Дедупликация имени
+    partners = db.get_partners(message.from_user.id)
+    existing_names = [p['name'] for p in partners]
+    unique_name = _deduplicate_name(existing_names, name)
+
+    if unique_name != name:
+        await message.answer(
+            f"ℹ️ Имя «{name}» уже занято. Сохраню как «{unique_name}»."
+        )
+
+    await state.update_data(partner_name=unique_name)
+    await state.set_state(ProfileAdd.date)
+    await message.answer(f"Дата рождения {unique_name}:\n<code>ДД.ММ.ГГГГ</code>",
                          parse_mode=ParseMode.HTML)
 
 
-@dp.message(PartnerAdd.date)
-async def partner_add_date(message: types.Message, state: FSMContext):
+@dp.message(ProfileAdd.date)
+async def profile_add_date(message: types.Message, state: FSMContext):
     ok, err = validate_date(message.text)
     if not ok:
         await message.answer(f"❌ {err}\n\nПопробуй снова:")
         return
     await state.update_data(partner_date=message.text.strip())
-    await state.set_state(PartnerAdd.time)
+    await state.set_state(ProfileAdd.time)
     await message.answer(
         "Время рождения:\n<code>ЧЧ:ММ</code>\n\nНе знаешь — напиши <code>не знаю</code>",
         parse_mode=ParseMode.HTML
     )
 
 
-@dp.message(PartnerAdd.time)
-async def partner_add_time(message: types.Message, state: FSMContext):
+@dp.message(ProfileAdd.time)
+async def profile_add_time(message: types.Message, state: FSMContext):
     ok, err, norm = validate_time(message.text)
     if not ok:
         await message.answer(f"❌ {err}\n\nПопробуй снова:")
         return
     await state.update_data(partner_time=norm)
-    await state.set_state(PartnerAdd.city)
+    await state.set_state(ProfileAdd.city)
     await message.answer("Город рождения?")
 
 
-@dp.message(PartnerAdd.city)
-async def partner_add_city(message: types.Message, state: FSMContext):
+@dp.message(ProfileAdd.city)
+async def profile_add_city(message: types.Message, state: FSMContext):
     city = message.text.strip()
     msg  = await message.answer("🔍 Ищу город...")
     geo  = await geocode_city(city)
@@ -708,15 +781,17 @@ async def partner_add_city(message: types.Message, state: FSMContext):
 
     chart_text = format_chart_text(chart, {'city': geo["display_name"]})
     await msg.edit_text(
-        f"✅ <b>{data['partner_name']}</b> добавлен!\n\n"
-        f"<pre>{chart_text}</pre>",
-        parse_mode=ParseMode.HTML, reply_markup=partner_actions_kb(pid)
+        f"✅ Профиль <b>{data['partner_name']}</b> сохранён!\n\n"
+        f"<pre>{chart_text}</pre>\n\n"
+        f"Теперь вы можете выбрать этот профиль в разделе «Астропрофиль» "
+        f"и задавать вопросы о {data['partner_name']} 🌟",
+        parse_mode=ParseMode.HTML, reply_markup=profile_actions_kb(pid)
     )
 
 
-@dp.callback_query(F.data.startswith("partner:compat:"))
-async def partner_compat(callback: types.CallbackQuery):
-    pid      = int(callback.data.split(":")[2])
+@dp.callback_query(F.data.startswith("profile:compat:"))
+async def profile_compat(callback: types.CallbackQuery):
+    pid = int(callback.data.split(":")[2])
     await callback.answer()
 
     user     = db.get_user(callback.from_user.id)
@@ -737,7 +812,7 @@ async def partner_compat(callback: types.CallbackQuery):
         f"💑 <b>Совместимость с {name}</b>\n\n"
         f"{compat['emoji']} <b>{compat['level']}</b> — {compat['score']}%\n\n"
         f"<b>Аспекты:</b>\n{aspects_text}\n\n"
-        f"<i>Их карта: ☉ {p_chart.get('sun_sign','?')} · ☽ {p_chart.get('moon_sign','?')}</i>"
+        f"<i>Карта {name}: ☉ {p_chart.get('sun_sign','?')} · ☽ {p_chart.get('moon_sign','?')}</i>"
     )
     await callback.message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -747,15 +822,15 @@ async def partner_compat(callback: types.CallbackQuery):
         await send_long(callback.message, interp, parse_mode=ParseMode.HTML)
 
 
-@dp.callback_query(F.data.startswith("partner:natal:"))
-async def partner_natal(callback: types.CallbackQuery):
-    pid      = int(callback.data.split(":")[2])
+@dp.callback_query(F.data.startswith("profile:natal:"))
+async def profile_natal(callback: types.CallbackQuery):
+    pid = int(callback.data.split(":")[2])
     await callback.answer()
 
     partners = db.get_partners(callback.from_user.id)
     p        = next((x for x in partners if x['id'] == pid), None)
     if not p:
-        await callback.message.answer("❌ Не найден.")
+        await callback.message.answer("❌ Профиль не найден.")
         return
 
     chart = p.get('chart', {})
@@ -777,141 +852,72 @@ async def partner_natal(callback: types.CallbackQuery):
         await msg2.edit_text("⚠️ Не удалось получить интерпретацию.")
 
 
-@dp.callback_query(F.data.startswith("partner:forecast:"))
-async def partner_forecast(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("profile:forecast:"))
+async def profile_forecast(callback: types.CallbackQuery):
     pid = int(callback.data.split(":")[2])
     await callback.answer()
 
     partners = db.get_partners(callback.from_user.id)
     p        = next((x for x in partners if x['id'] == pid), None)
     if not p:
-        await callback.message.answer("❌ Не найден.")
+        await callback.message.answer("❌ Профиль не найден.")
         return
 
     chart = p.get('chart', {})
     city  = p.get('city', '?')
+    name  = p.get('name', '?')
     await _do_forecast(
         callback.message, callback.from_user.id, "today",
-        chart_override=chart, location_override=city
+        chart_override=chart, location_override=city, target_name=name
     )
 
 
-@dp.callback_query(F.data.startswith("partner:delete:"))
-async def partner_delete_confirm(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("profile:delete:"))
+async def profile_delete_confirm(callback: types.CallbackQuery):
     pid = int(callback.data.split(":")[2])
     await callback.answer()
     partners = db.get_partners(callback.from_user.id)
     p = next((x for x in partners if x['id'] == pid), None)
     name = p.get('name', '?') if p else '?'
     await callback.message.edit_text(
-        f"Удалить <b>{name}</b>?",
+        f"Удалить <b>{name}</b> из астропрофилей?",
         parse_mode=ParseMode.HTML,
         reply_markup=confirm_delete_kb(pid)
     )
 
 
-@dp.callback_query(F.data.startswith("partner:confirm_delete:"))
-async def partner_delete_do(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("profile:confirm_delete:"))
+async def profile_delete_do(callback: types.CallbackQuery):
     pid = int(callback.data.split(":")[2])
     await callback.answer()
     db.delete_partner(pid, callback.from_user.id)
 
-    # Если удалён активный профиль — сбросить на себя
-    if active_profile.get(callback.from_user.id) == pid:
-        active_profile[callback.from_user.id] = None
+    # Сбросить активный профиль если удалили активный
+    ap = active_profiles.get(callback.from_user.id)
+    if ap and ap.get("type") == "other" and ap.get("id") == pid:
+        active_profiles[callback.from_user.id] = {"type": "self"}
 
+    user = db.get_user(callback.from_user.id)
+    user_name = user.get('first_name', 'Пользователь') if user else 'Пользователь'
     partners = db.get_partners(callback.from_user.id)
-    if partners:
-        await callback.message.edit_text(
-            f"✅ Удалено.\n\n👥 <b>Люди</b>:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=partners_list_kb(partners)
-        )
-    else:
-        await callback.message.edit_text(
-            "✅ Удалено. Список пуст.",
-            reply_markup=no_partners_kb()
-        )
+
+    await callback.message.edit_text(
+        "✅ Удалено.",
+        reply_markup=astroprofile_list_kb(user_name, partners) if partners else no_profiles_kb()
+    )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── ТАРО ─────────────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data == "tarot:spread")
-async def handle_tarot_from_forecast(callback: types.CallbackQuery):
-    """
-    Кнопка «🃏 Расклад Таро» под прогнозом/ответом бота.
-    Дополняет предыдущий астрологический ответ раскладом.
-    """
-    uid = callback.from_user.id
-    await callback.answer("🃏 Тяну карты...")
-
-    user = db.get_user(uid)
-    if not user:
-        await callback.message.answer("Сначала введи данные рождения.", reply_markup=settings_menu())
-        return
-
-    ctx = last_bot_context.get(uid, {})
-    astro_response = ctx.get("response", "")
-    chart = ctx.get("chart") or user.get('chart', {})
-
-    natal_summary, transits_text, current_city = _get_astro_context(user)
-
-    # Определяем тип расклада
-    if ctx.get("type") == "forecast":
-        # Аркан дня — дополнение к прогнозу
-        card = draw_single_arcana()
-        prompt = build_arcana_day_prompt(card, natal_summary, transits_text, astro_response)
-        card_display = format_card(card)
-
-        msg = await callback.message.answer(f"🃏 Тяну Аркан дня...\n\n{card_display}")
-        result = await ask_groq(prompt, max_tokens=800)
-        if result:
-            await msg.edit_text(f"🌟 <b>Аркан дня</b>\n\n{card_display}\n\n{result}",
-                                parse_mode=ParseMode.HTML)
-        else:
-            await msg.edit_text(f"🌟 Аркан дня: {card_display}\n\n⚠️ Не удалось интерпретировать.")
-    else:
-        # Расклад из 3 карт — бот придумывает позиции под контекст
-        cards = draw_cards(3)
-
-        # Генерируем позиции на основе контекста
-        question = ctx.get("question", "общий вопрос")
-        positions_prompt = (
-            f"Человек задал вопрос: «{question}»\n"
-            f"Придумай 3 позиции для расклада Таро из трёх карт, "
-            f"которые помогут ответить на этот вопрос.\n"
-            f"Формат: просто 3 строки, каждая — название позиции (3-5 слов).\n"
-            f"Например:\n"
-            f"Суть ситуации\n"
-            f"Что поможет\n"
-            f"К чему это ведёт\n"
-            f"Ответь только 3 строки, без нумерации и пояснений."
-        )
-        positions_text = await ask_groq(positions_prompt, max_tokens=100)
-        if positions_text:
-            positions = [line.strip() for line in positions_text.strip().split('\n') if line.strip()][:3]
-        else:
-            positions = ["Суть ситуации", "Совет", "Результат"]
-
-        # Дополняем до 3 если меньше
-        while len(positions) < 3:
-            positions.append(f"Позиция {len(positions) + 1}")
-
-        spread_display = format_spread(cards, positions)
-        msg = await callback.message.answer(f"🃏 <b>Расклад Таро</b>\n\n{spread_display}",
-                                            parse_mode=ParseMode.HTML)
-
-        # Интерпретация с астрологией
-        interp_prompt = build_tarot_prompt_for_astro(
-            cards, positions, natal_summary, transits_text,
-            astro_response, question
-        )
-        result = await ask_groq(interp_prompt, max_tokens=1200)
-        if result:
-            await callback.message.answer(f"✨ <b>Интерпретация</b>\n\n{result}",
-                                          parse_mode=ParseMode.HTML)
+@dp.callback_query(F.data == "profile:list")
+async def profile_back_list(callback: types.CallbackQuery):
+    await callback.answer()
+    user = db.get_user(callback.from_user.id)
+    user_name = user.get('first_name', 'Пользователь') if user else 'Пользователь'
+    partners = db.get_partners(callback.from_user.id)
+    await callback.message.edit_text(
+        f"🌟 <b>Астропрофили</b>\n\nВыберите профиль:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=astroprofile_list_kb(user_name, partners)
+    )
 
 
 # ── Текущее местоположение ────────────────────────────────────────────────────
@@ -957,12 +963,17 @@ async def show_settings(message: types.Message):
         chart   = user.get('chart', {})
         cur     = user.get('current_city')
         loc_str = f"\n📍 Текущий регион: {cur}" if cur else ""
+        ap = active_profiles.get(message.from_user.id)
+        if ap and ap.get("type") == "other":
+            profile_str = f"\n🌟 Активный профиль: {ap['name']}"
+        else:
+            profile_str = "\n🌟 Активный профиль: Я"
         await message.answer(
             f"⚙️ <b>Настройки</b>\n\n"
             f"📅 Дата: {user.get('birth_date', '?')}\n"
             f"🕐 Время: {user.get('birth_time', 'не указано')}\n"
             f"🌍 Город рождения: {user.get('city', '?')}\n"
-            f"🕰 Timezone: {user.get('timezone', '?')}{loc_str}\n"
+            f"🕰 Timezone: {user.get('timezone', '?')}{loc_str}{profile_str}\n"
             f"☉ Знак: {chart.get('sun_sign', '?')}",
             parse_mode=ParseMode.HTML, reply_markup=settings_menu()
         )
@@ -995,13 +1006,14 @@ async def show_help(message: types.Message):
         "🔮 <b>Команды бота:</b>\n\n"
         "<b>🔮 Моя карта</b> — полная натальная карта + 12 домов\n"
         "<b>📅 Прогноз</b> — прогноз на день / неделю / месяц / дату\n"
-        "<b>🪐 Астропрофиль</b> — твои данные и данные других людей\n"
+        "<b>🌟 Астропрофиль</b> — ваши профили: «Я» и другие люди\n"
         "<b>📍 Мой регион</b> — текущее местоположение для прогнозов\n"
         "<b>⚙️ Настройки</b> — изменить данные рождения\n"
         "<b>📜 История</b> — последние прогнозы\n\n"
-        "🃏 <b>Таро</b> — расклады доступны через кнопку после ответов бота\n\n"
-        "💬 <b>Свободный диалог</b> — просто напиши мне вопрос!\n"
-        "Я отвечу с учётом твоей натальной карты и текущих транзитов.",
+        "💬 <b>Свободный диалог</b> — просто напишите вопрос!\n"
+        "Я отвечу с учётом натальной карты, транзитов и текущей обстановки.\n\n"
+        "🃏 <b>Расклад Таро</b> — попросите в чате: «сделай расклад Таро»\n"
+        "Расклад трактуется в синергии с вашим астропрофилем!",
         parse_mode=ParseMode.HTML, reply_markup=main_menu()
     )
 
@@ -1012,6 +1024,7 @@ async def show_help(message: types.Message):
 async def free_chat(message: types.Message, state: FSMContext):
     """
     Обработчик свободных текстовых сообщений.
+    Учитывает активный астропрофиль для правильного контекста.
     """
     current_state = await state.get_state()
     if current_state is not None:
@@ -1020,9 +1033,9 @@ async def free_chat(message: types.Message, state: FSMContext):
     user = db.get_user(message.from_user.id)
     if not user:
         await message.answer(
-            "🔮 Чтобы я мог дать тебе персональный совет, "
-            "мне нужны твои данные рождения.\n\n"
-            "Нажми '✏️ Изменить данные' чтобы начать!",
+            "🔮 Чтобы я мог дать персональный совет, "
+            "мне нужны ваши данные рождения.\n\n"
+            "Нажмите '✏️ Изменить данные' чтобы начать!",
             reply_markup=settings_menu()
         )
         return
@@ -1037,36 +1050,13 @@ async def free_chat(message: types.Message, state: FSMContext):
 
     msg = await message.answer("🔮 Думаю...")
 
-    # Определяем, есть ли активный профиль другого человека
+    # Получаем активный профиль
+    profile_info = _get_active_profile_info(message.from_user.id)
+
+    # Строим системный промпт с учётом профиля
+    system_prompt = _build_system_prompt(user, profile_info)
+
     uid = message.from_user.id
-    target_pid = active_profile.get(uid)
-    target_chart = None
-    target_name = None
-
-    if target_pid:
-        partners = db.get_partners(uid)
-        p = next((x for x in partners if x['id'] == target_pid), None)
-        if p:
-            target_chart = p.get('chart', {})
-            target_name = p.get('name', '?')
-
-    # Строим системный промпт
-    system_prompt = _build_system_prompt(user)
-
-    # Если активен чужой профиль — дополняем промпт
-    if target_chart and target_name:
-        target_summary = build_natal_summary(target_chart)
-        system_prompt += f"""
-
-═══ АКТИВНЫЙ ПРОФИЛЬ: {target_name} ═══
-{target_summary}
-Солнце: {target_chart.get('sun_sign', '?')}, Луна: {target_chart.get('moon_sign', '?')}, Асц: {target_chart.get('ascendant', '?')}
-
-Пользователь сейчас задаёт вопросы о {target_name}. 
-Учитывай натальные данные {target_name} при ответах.
-Если вопрос о совместимости — сравнивай карту клиента с картой {target_name}."""
-
-    # Добавляем сообщение пользователя в историю
     chat_histories[uid].append({"role": "user", "content": user_text})
 
     if len(chat_histories[uid]) > MAX_HISTORY:
@@ -1082,35 +1072,12 @@ async def free_chat(message: types.Message, state: FSMContext):
         if len(chat_histories[uid]) > MAX_HISTORY:
             chat_histories[uid] = chat_histories[uid][-MAX_HISTORY:]
 
-        # Сохраняем контекст для Таро
-        last_bot_context[uid] = {
-            "type": "chat",
-            "response": response,
-            "question": user_text,
-            "chart": target_chart or user.get('chart', {}),
-        }
-
         await msg.delete()
-        # Отправляем с кнопкой «Расклад Таро»
-        await send_long_with_tarot(message, response)
+        await send_long(message, response)
     else:
         await msg.edit_text(
-            "⚠️ Не удалось получить ответ. Попробуй ещё раз через минуту."
+            "⚠️ Не удалось получить ответ. Попробуйте ещё раз через минуту."
         )
-
-
-async def send_long_with_tarot(message: types.Message, text: str):
-    """Отправить текст, к последнему сообщению прикрепить кнопку Таро."""
-    parts = []
-    for i in range(0, len(text), 4000):
-        parts.append(text[i:i + 4000])
-
-    for i, part in enumerate(parts):
-        if i == len(parts) - 1:
-            # Последняя часть — с кнопкой
-            await message.answer(part, reply_markup=tarot_button())
-        else:
-            await message.answer(part)
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
